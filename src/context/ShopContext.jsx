@@ -1,0 +1,1090 @@
+import React, { createContext, useContext, useState, useEffect } from 'react';
+import { PRODUCTS, CATEGORIES, BRAND_CONFIG } from '../data/products';
+import { supabaseQuery } from '../lib/supabase';
+
+const ShopContext = createContext();
+
+const DELETED_PRODUCTS_KEY = 'ayaana_deleted_product_ids';
+
+export const DEPRECATED_PRODUCT_IDS = new Set([
+  'hand-foot-whitening-repair-complex',
+  'miracle-glow-night-balm',
+  'triple-hyaluronic-plumping-serum',
+  'velvet-saffron-glow-body-treatment',
+  'rose-damascena-clarifying-cleanser',
+  'herbal-whitening-radiance-toner',
+  'radiance-skin-repair-cream'
+]);
+
+function getDeletedProductIds() {
+  try {
+    const raw = localStorage.getItem(DELETED_PRODUCTS_KEY);
+    const parsed = raw ? JSON.parse(raw) : [];
+    return new Set([...parsed, ...DEPRECATED_PRODUCT_IDS]);
+  } catch {
+    return new Set(DEPRECATED_PRODUCT_IDS);
+  }
+}
+
+function saveDeletedProductIds(setOrArray) {
+  try {
+    const arr = Array.from(setOrArray);
+    localStorage.setItem(DELETED_PRODUCTS_KEY, JSON.stringify(arr));
+  } catch (e) {
+    console.error("Failed to save deleted product IDs:", e);
+  }
+}
+
+const mapDbToProduct = (dbProd) => ({
+  id: dbProd.id,
+  name: dbProd.name,
+  tagline: dbProd.tagline || '',
+  category: dbProd.category || 'crochet-flowers',
+  categoryName: dbProd.category_name || dbProd.category || 'Crochet Flowers',
+  volume: dbProd.volume || '50g',
+  pricePKR: Number(dbProd.price_pkr) || 0,
+  originalPricePKR: Number(dbProd.original_price_pkr) || Math.round((Number(dbProd.price_pkr) || 0) * 1.2),
+  priceUSD: Number(dbProd.price_usd) || Number(((Number(dbProd.price_pkr) || 0) * 0.0036).toFixed(2)),
+  originalPriceUSD: Number(((Number(dbProd.price_pkr) || 0) * 0.0036 * 1.2).toFixed(2)),
+  stock: dbProd.stock !== undefined && dbProd.stock !== null && !isNaN(Number(dbProd.stock)) ? Number(dbProd.stock) : 50,
+  badge: dbProd.badge || '',
+  has3D: Boolean(dbProd.has_3d),
+  isHero: false,
+  image: dbProd.image || '/assets/hero.png',
+  secondaryImage: (Array.isArray(dbProd.images) && dbProd.images[1]) || dbProd.image || '/assets/hero.png',
+  images: Array.isArray(dbProd.images) && dbProd.images.length > 0 ? dbProd.images : [dbProd.image || '/assets/hero.png'],
+  description: dbProd.description || '',
+  howToUse: dbProd.how_to_use || '',
+  ingredients: dbProd.ingredients || '',
+  benefits: Array.isArray(dbProd.benefits) ? dbProd.benefits : [],
+  clinicalResults: dbProd.clinical_results || '',
+  rating: Number(dbProd.rating) || 5.0,
+  reviewsCount: Number(dbProd.reviews_count) || 100
+});
+
+const mapProductToDb = (p) => ({
+  id: p.id,
+  name: p.name,
+  tagline: p.tagline || '',
+  category: p.category || 'crochet-flowers',
+  category_name: p.categoryName || '',
+  volume: p.volume || '50g',
+  price_pkr: Number(p.pricePKR) || 0,
+  original_price_pkr: Number(p.originalPricePKR) || Math.round((Number(p.pricePKR) || 0) * 1.2),
+  price_usd: Number(p.priceUSD) || Number(((Number(p.pricePKR) || 0) * 0.0036).toFixed(2)),
+  stock: p.stock !== undefined && p.stock !== null && !isNaN(Number(p.stock)) ? Number(p.stock) : 50,
+  badge: p.badge || '',
+  image: p.image || (Array.isArray(p.images) && p.images[0]) || '',
+  images: Array.isArray(p.images) && p.images.length > 0 ? p.images : [p.image],
+  description: p.description || '',
+  how_to_use: p.howToUse || '',
+  ingredients: p.ingredients || '',
+  benefits: Array.isArray(p.benefits) ? p.benefits : [],
+  has_3d: Boolean(p.has3D),
+  rating: Number(p.rating) || 5.0,
+  reviews_count: Number(p.reviewsCount) || 100
+});
+
+export function ShopProvider({ children }) {
+  // Products state (preserves admin additions, edits, order & permanently removes deleted items)
+  const [products, setProducts] = useState(() => {
+    const deletedIds = getDeletedProductIds();
+    const saved = localStorage.getItem('ayaana_products');
+
+    if (!saved) {
+      return PRODUCTS.filter((p) => !deletedIds.has(p.id) && !DEPRECATED_PRODUCT_IDS.has(p.id));
+    }
+
+    try {
+      const parsed = JSON.parse(saved);
+      // Clean up deprecated template items if present, AND any deleted IDs
+      const officialById = new Map(PRODUCTS.map((p) => [p.id, p]));
+      const validCategories = new Set(CATEGORIES.map((category) => category.id));
+      const cleaned = parsed
+        .filter((p) => !DEPRECATED_PRODUCT_IDS.has(p.id) && !deletedIds.has(p.id) && validCategories.has(p.category))
+        .map((p) => officialById.get(p.id) || p);
+
+      // Only import new official products if they were NEVER deleted by the admin
+      const existingIds = new Set(cleaned.map((p) => p.id));
+      const missingFromOfficial = PRODUCTS.filter(
+        (p) => !existingIds.has(p.id) && !deletedIds.has(p.id) && !DEPRECATED_PRODUCT_IDS.has(p.id)
+      );
+
+      const finalProducts = [...cleaned, ...missingFromOfficial];
+      // Immediately scrub old cached template products from localStorage
+      localStorage.setItem('ayaana_products', JSON.stringify(finalProducts));
+      return finalProducts;
+    } catch {
+      return PRODUCTS.filter((p) => !deletedIds.has(p.id) && !DEPRECATED_PRODUCT_IDS.has(p.id));
+    }
+  });
+
+  // Cart state
+  const [cart, setCart] = useState(() => {
+    const saved = localStorage.getItem('ayaana_cart');
+    return saved ? JSON.parse(saved) : [];
+  });
+
+  // Wishlist state
+  const [wishlist, setWishlist] = useState(() => {
+    const saved = localStorage.getItem('ayaana_wishlist');
+    return saved ? JSON.parse(saved) : [];
+  });
+
+  // Currency: 'PKR' or 'USD'
+  const [currency, setCurrency] = useState(() => {
+    return localStorage.getItem('ayaana_currency') || 'PKR';
+  });
+
+  // Active discount code
+  const [couponCode, setCouponCode] = useState('');
+  const [appliedDiscount, setAppliedDiscount] = useState(null); // { code, percent, label }
+
+  // Modal / Drawer visibility
+  const [activeProduct, setActiveProductRaw] = useState(null);
+
+  const setActiveProduct = (prod) => {
+    if (prod && typeof prod === 'object' && prod.id === 'radiance-skin-repair-cream') {
+      const faceCream = products.find(p => p.id === 'face-whitening-cream');
+      setActiveProductRaw(faceCream || prod);
+    } else {
+      setActiveProductRaw(prod);
+    }
+  };
+
+  const [isCartOpen, setIsCartOpen] = useState(false);
+  const [isWishlistOpen, setIsWishlistOpen] = useState(false);
+  const [isCheckoutOpen, setIsCheckoutOpen] = useState(false);
+  const [isTrackingOpen, setIsTrackingOpen] = useState(false);
+  const [isAdminOpen, setIsAdminOpen] = useState(() => {
+    try {
+      return new URLSearchParams(window.location.search).get('admin') === 'true';
+    } catch {
+      return false;
+    }
+  });
+
+  useEffect(() => {
+    window.__openAdmin = () => setIsAdminOpen(true);
+  }, []);
+
+  // ── Site Customization State ──────────────────────────────────────────────────
+  // Hero Section settings
+  const [heroSettings, setHeroSettings] = useState(() => {
+    const saved = localStorage.getItem('ayaana_hero_settings');
+    if (saved) {
+      try {
+        const savedSettings = JSON.parse(saved);
+        const legacyBadgeText = /skincare|skin|whitening|botanical|radiance|moisture|herbal/i;
+        return {
+          ...savedSettings,
+          heroBadge1: legacyBadgeText.test(savedSettings.heroBadge1 || '') ? '✦ Handmade with Care' : savedSettings.heroBadge1,
+          heroBadge2: legacyBadgeText.test(savedSettings.heroBadge2 || '') ? '✦ Custom Colors Available' : savedSettings.heroBadge2
+        };
+      } catch {}
+    }
+    return {
+      heroProductId: null,      // null = use isHero flag or products[0]
+      heroModelType: 'hand-feet-cream', // 'hand-feet-cream' | 'face-whitening-cream' | 'toner' | 'natural-glow-mask'
+      heroBadge1: '✦ Handmade with Care',
+      heroBadge2: '✦ Custom Colors Available'
+    };
+  });
+
+  // Transformation section 3D model
+  const [transformationModel, setTransformationModel] = useState(() => {
+    const saved = localStorage.getItem('ayaana_transformation_model');
+    if (saved) { try { return JSON.parse(saved); } catch {} }
+    return {
+      modelType: 'hand-feet-cream', // 'hand-feet-cream' | 'face-whitening-cream' | 'toner'
+      productId: null               // which product's price/name to show alongside
+    };
+  });
+
+  // Admin-managed reviews covering all official active products on website
+  const REVIEWS_STORAGE_VERSION = 'ayaana_reviews_v6_crochet';
+
+  const DEFAULT_REVIEWS = [];
+
+  const [siteReviews, setSiteReviews] = useState(() => {
+    const version = localStorage.getItem('ayaana_reviews_version');
+    const saved = localStorage.getItem('ayaana_reviews');
+
+    if (saved && version === REVIEWS_STORAGE_VERSION) {
+      try {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          const cleaned = parsed.filter(r => {
+            if (!r || !r.product) return false;
+            const n = r.product.trim().toLowerCase();
+            return !n.includes('complex + skin repair') &&
+                   !n.includes('radiance skin repair') &&
+                   !n.includes('night balm') &&
+                   !n.includes('miracle glow') &&
+                   !n.includes('bundle') &&
+                   !n.includes('herbal whitening & radiance toner');
+          });
+          if (cleaned.length > 0) {
+            return cleaned;
+          }
+        }
+      } catch {}
+    }
+
+    // Auto-migrate to current website products reviews
+    localStorage.setItem('ayaana_reviews_version', REVIEWS_STORAGE_VERSION);
+    localStorage.setItem('ayaana_reviews', JSON.stringify(DEFAULT_REVIEWS));
+    return DEFAULT_REVIEWS;
+  });
+
+  // Auto-purge any reviews for deleted or non-existent products whenever products list updates
+  useEffect(() => {
+    if (!products || products.length === 0) return;
+    const activeNames = new Set(products.map(p => p.name.trim().toLowerCase()));
+    const activeIds = new Set(products.map(p => p.id));
+
+    setSiteReviews((prev) => {
+      const filtered = prev.filter(r => {
+        if (!r || !r.product) return false;
+        const n = r.product.trim().toLowerCase();
+        if (
+          n.includes('complex + skin repair') ||
+          n.includes('radiance skin repair') ||
+          n.includes('night balm') ||
+          n.includes('miracle glow') ||
+          n.includes('bundle') ||
+          n.includes('herbal whitening & radiance toner')
+        ) {
+          return false;
+        }
+        return activeNames.has(n) || (r.productId && activeIds.has(r.productId));
+      });
+
+      if (filtered.length !== prev.length) {
+        localStorage.setItem('ayaana_reviews', JSON.stringify(filtered));
+        return filtered;
+      }
+      return prev;
+    });
+  }, [products]);
+
+  // Girl's Image / Living Model Routine Products
+  const [portraitProductIds, setPortraitProductIds] = useState(() => {
+    const saved = localStorage.getItem('ayaana_portrait_products');
+    if (saved) { try { return JSON.parse(saved); } catch {} }
+    return ['face-whitening-cream', 'whitening-toner'];
+  });
+  const [isPortraitModalOpen, setIsPortraitModalOpen] = useState(false);
+
+  // Persist customization state
+  useEffect(() => { localStorage.setItem('ayaana_hero_settings', JSON.stringify(heroSettings)); }, [heroSettings]);
+  useEffect(() => { localStorage.setItem('ayaana_transformation_model', JSON.stringify(transformationModel)); }, [transformationModel]);
+  useEffect(() => { localStorage.setItem('ayaana_reviews', JSON.stringify(siteReviews)); }, [siteReviews]);
+  useEffect(() => { localStorage.setItem('ayaana_portrait_products', JSON.stringify(portraitProductIds)); }, [portraitProductIds]);
+
+  const updateHeroSettings = (updates) => setHeroSettings(prev => ({ ...prev, ...updates }));
+  const updateTransformationModel = (updates) => setTransformationModel(prev => ({ ...prev, ...updates }));
+  const updatePortraitProductIds = (ids) => setPortraitProductIds(ids);
+  const addReview = (review) => {
+    const newReview = { ...review, id: Date.now(), verified: true };
+    setSiteReviews(prev => [newReview, ...prev]);
+    return newReview;
+  };
+  const deleteReview = (reviewId) => setSiteReviews(prev => prev.filter(r => r.id !== reviewId));
+  const updateReview = (reviewId, updates) => setSiteReviews(prev => prev.map(r => r.id === reviewId ? { ...r, ...updates } : r));
+
+  // Multiple Admin Management State
+  const [adminsList, setAdminsList] = useState(() => {
+    const defaultAdmins = [
+      {
+        id: 'admin-super-basit',
+        name: 'Basit Nayab',
+        email: 'basitmalix01@gmail.com',
+        password: 'Muhana5424@.',
+        role: 'Super Admin',
+        createdAt: '2026-09-26'
+      },
+      {
+        id: 'admin-syeda',
+        name: 'Syeda Ayaana',
+        email: 'Syedaayaana20@gmail.com',
+        password: 'Ayaanaali69$',
+        role: 'Store Admin',
+        createdAt: '2026-09-01'
+      }
+    ];
+
+    const saved = localStorage.getItem('ayaana_admins_list');
+    if (!saved) return defaultAdmins;
+    try {
+      let parsed = JSON.parse(saved);
+      if (!Array.isArray(parsed)) return defaultAdmins;
+
+      // Ensure Super Admin Basit is always present
+      if (!parsed.some((a) => a.email.toLowerCase() === 'basitmalix01@gmail.com')) {
+        parsed.unshift(defaultAdmins[0]);
+      }
+
+      // Ensure Syeda Ayaana (Store Admin) with exact user credentials is always present & up-to-date
+      const syedaIdx = parsed.findIndex((a) =>
+        a.email.toLowerCase() === 'syedaayaana20@gmail.com' || a.email.toLowerCase() === 'admin@ayaanas.com'
+      );
+      if (syedaIdx >= 0) {
+        parsed[syedaIdx] = {
+          ...parsed[syedaIdx],
+          name: 'Syeda Ayaana',
+          email: 'Syedaayaana20@gmail.com',
+          password: 'Ayaanaali69$',
+          role: 'Store Admin'
+        };
+      } else {
+        parsed.push(defaultAdmins[1]);
+      }
+
+      return parsed;
+    } catch {
+      return defaultAdmins;
+    }
+  });
+
+  const [currentAdminUser, setCurrentAdminUser] = useState(() => {
+    const saved = localStorage.getItem('ayaana_current_admin');
+    if (saved) {
+      try { return JSON.parse(saved); } catch { /* ignore */ }
+    }
+    return {
+      id: 'admin-syeda',
+      name: 'Syeda Ayaana',
+      email: 'Syedaayaana20@gmail.com',
+      role: 'Store Admin'
+    };
+  });
+
+  const [adminCredentials, setAdminCredentials] = useState(() => {
+    const saved = localStorage.getItem('ayaana_admin_creds');
+    return saved ? JSON.parse(saved) : { email: "Syedaayaana20@gmail.com", password: "Ayaanaali69$" };
+  });
+
+  const [isAdminLoggedIn, setIsAdminLoggedIn] = useState(() => {
+    return localStorage.getItem('ayaana_admin_logged_in') === 'true';
+  });
+
+  // Recent order state for tracking & confirmation
+  const [recentOrders, setRecentOrders] = useState(() => {
+    const saved = localStorage.getItem('ayaana_orders');
+    return saved ? JSON.parse(saved) : [
+      {
+        orderId: "AY-89241",
+        customerName: "Ayesha Malik",
+        phone: "+92 300 1234567",
+        city: "Lahore",
+        address: "Gulberg III, Lahore",
+        paymentMethod: "Cash on Delivery (COD)",
+        items: [
+          { name: "Crochet Flower Bouquet", volume: "Small Bouquet", quantity: 1, pricePKR: 3500, priceUSD: 12.60 }
+        ],
+        total: 1199,
+        currency: "PKR",
+        status: "In Transit",
+        date: "2026-09-18",
+        courier: "TCS Express",
+        trackingNo: "TCS992014881"
+      }
+    ];
+  });
+
+  // Sync to localStorage
+  useEffect(() => {
+    localStorage.setItem('ayaana_cart', JSON.stringify(cart));
+  }, [cart]);
+
+  useEffect(() => {
+    localStorage.setItem('ayaana_wishlist', JSON.stringify(wishlist));
+  }, [wishlist]);
+
+  useEffect(() => {
+    localStorage.setItem('ayaana_currency', currency);
+  }, [currency]);
+
+  useEffect(() => {
+    localStorage.setItem('ayaana_products', JSON.stringify(products));
+  }, [products]);
+
+  // 🔄 Real-time Cloud Sync with Supabase on Mount & Tab Focus
+  useEffect(() => {
+    let isMounted = true;
+
+    async function syncProductsFromCloud() {
+      try {
+        const { data, error } = await supabaseQuery('products?select=*&order=created_at.asc');
+        if (!error && Array.isArray(data) && data.length > 0) {
+          const officialById = new Map(PRODUCTS.map((p) => [p.id, p]));
+          const validCategories = new Set(CATEGORIES.map((category) => category.id));
+          const mapped = data.map((row) => officialById.get(row.id) || mapDbToProduct(row))
+            .filter((product) => validCategories.has(product.category));
+          const deletedIds = getDeletedProductIds();
+          const cleanProducts = mapped.filter((p) => !deletedIds.has(p.id) && !DEPRECATED_PRODUCT_IDS.has(p.id));
+
+          if (isMounted && cleanProducts.length > 0) {
+            const dbIds = new Set(cleanProducts.map(p => p.id));
+            const missingLocals = PRODUCTS.filter(p => !dbIds.has(p.id) && !deletedIds.has(p.id) && !DEPRECATED_PRODUCT_IDS.has(p.id));
+            const finalMerged = [...cleanProducts, ...missingLocals];
+            setProducts(finalMerged);
+            localStorage.setItem('ayaana_products', JSON.stringify(finalMerged));
+          }
+        }
+      } catch (e) {
+        console.warn("Cloud products sync fallback:", e);
+      }
+    }
+
+    syncProductsFromCloud();
+
+    // Re-check cloud when user refocuses tab / switches browser
+    const handleFocus = () => { syncProductsFromCloud(); };
+    window.addEventListener('focus', handleFocus);
+
+    return () => {
+      isMounted = false;
+      window.removeEventListener('focus', handleFocus);
+    };
+  }, []);
+
+  useEffect(() => {
+    localStorage.setItem('ayaana_orders', JSON.stringify(recentOrders));
+  }, [recentOrders]);
+
+  useEffect(() => {
+    localStorage.setItem('ayaana_admins_list', JSON.stringify(adminsList));
+  }, [adminsList]);
+
+  useEffect(() => {
+    localStorage.setItem('ayaana_current_admin', JSON.stringify(currentAdminUser));
+  }, [currentAdminUser]);
+
+  useEffect(() => {
+    localStorage.setItem('ayaana_admin_creds', JSON.stringify(adminCredentials));
+  }, [adminCredentials]);
+
+  useEffect(() => {
+    localStorage.setItem('ayaana_admin_logged_in', isAdminLoggedIn ? 'true' : 'false');
+  }, [isAdminLoggedIn]);
+
+  // Lock background body scroll when any modal or drawer is active
+  useEffect(() => {
+    const isAnyModalOpen = Boolean(
+      activeProduct || isCartOpen || isWishlistOpen || isCheckoutOpen || isTrackingOpen || isAdminOpen || isPortraitModalOpen
+    );
+    if (isAnyModalOpen) {
+      const scrollBarWidth = window.innerWidth - document.documentElement.clientWidth;
+      document.body.style.overflow = 'hidden';
+      if (scrollBarWidth > 0) {
+        document.body.style.paddingRight = `${scrollBarWidth}px`;
+      }
+    } else {
+      document.body.style.overflow = '';
+      document.body.style.paddingRight = '';
+    }
+    return () => {
+      document.body.style.overflow = '';
+      document.body.style.paddingRight = '';
+    };
+  }, [activeProduct, isCartOpen, isWishlistOpen, isCheckoutOpen, isTrackingOpen, isAdminOpen, isPortraitModalOpen]);
+
+  // Admin Auth Methods
+  const adminLogin = (emailOrUser, password) => {
+    const inputClean = (emailOrUser || '').trim().toLowerCase();
+    const passInput = (password || '').trim();
+
+    // 1. Direct match for Syeda Ayaana (Store Admin)
+    if (
+      (inputClean === 'syedaayaana20@gmail.com' ||
+        inputClean === 'syedaayaana20' ||
+        inputClean === 'syeda' ||
+        inputClean === 'ayaana' ||
+        inputClean === 'admin@ayaanas.com') &&
+      passInput === 'Ayaanaali69$'
+    ) {
+      const syedaUser = {
+        id: 'admin-syeda',
+        name: 'Syeda Ayaana',
+        email: 'Syedaayaana20@gmail.com',
+        role: 'Store Admin',
+        password: 'Ayaanaali69$',
+        createdAt: '2026-09-01'
+      };
+      setIsAdminLoggedIn(true);
+      setCurrentAdminUser(syedaUser);
+      setAdminCredentials({ email: syedaUser.email, password: syedaUser.password });
+      return { success: true, user: syedaUser };
+    }
+
+    // 2. Direct match for Basit Nayab (Super Admin)
+    if (
+      (inputClean === 'basitmalix01@gmail.com' || inputClean === 'basit') &&
+      passInput === 'Muhana5424@.'
+    ) {
+      const superUser = {
+        id: 'admin-super-basit',
+        name: 'Basit Nayab',
+        email: 'basitmalix01@gmail.com',
+        role: 'Super Admin',
+        password: 'Muhana5424@.',
+        createdAt: '2026-09-26'
+      };
+      setIsAdminLoggedIn(true);
+      setCurrentAdminUser(superUser);
+      setAdminCredentials({ email: superUser.email, password: superUser.password });
+      return { success: true, user: superUser };
+    }
+
+    // 3. Dynamic match against any registered admin in adminsList
+    const matchedAdmin = adminsList.find((admin) => {
+      const admEmail = admin.email.toLowerCase();
+      const admUsername = admEmail.split('@')[0];
+      const matchIdentity = inputClean === admEmail || inputClean === admUsername;
+      return matchIdentity && admin.password === passInput;
+    });
+
+    if (matchedAdmin) {
+      setIsAdminLoggedIn(true);
+      setCurrentAdminUser(matchedAdmin);
+      setAdminCredentials({ email: matchedAdmin.email, password: matchedAdmin.password });
+      return { success: true, user: matchedAdmin };
+    }
+
+    return {
+      success: false,
+      message: "Invalid credentials. Please enter your valid email and password."
+    };
+  };
+
+  const adminLogout = () => {
+    setIsAdminLoggedIn(false);
+  };
+
+  const addNewAdmin = (newAdmin) => {
+    if (currentAdminUser?.role !== 'Super Admin') {
+      return { success: false, message: "Security Notice: Only Super Admin has permission to create new admin accounts." };
+    }
+    if (!newAdmin.email || !newAdmin.password) {
+      return { success: false, message: "Email and password are required." };
+    }
+    const emailClean = newAdmin.email.trim().toLowerCase();
+    if (adminsList.some((a) => a.email.toLowerCase() === emailClean)) {
+      return { success: false, message: "An admin with this email already exists." };
+    }
+
+    const createdAdmin = {
+      id: `admin-${Date.now()}`,
+      name: newAdmin.name?.trim() || emailClean.split('@')[0],
+      email: emailClean,
+      password: newAdmin.password,
+      role: newAdmin.role || 'Store Admin',
+      createdAt: new Date().toISOString().split('T')[0]
+    };
+
+    setAdminsList((prev) => [...prev, createdAdmin]);
+    return { success: true, admin: createdAdmin };
+  };
+
+  const deleteAdmin = (adminId) => {
+    if (currentAdminUser?.role !== 'Super Admin') {
+      return { success: false, message: "Security Notice: Only Super Admin has permission to remove admin accounts." };
+    }
+    if (adminsList.length <= 1) {
+      return { success: false, message: "Cannot remove the only remaining admin account." };
+    }
+    if (currentAdminUser?.id === adminId) {
+      return { success: false, message: "You cannot delete your own currently active account." };
+    }
+    setAdminsList((prev) => prev.filter((a) => a.id !== adminId));
+    return { success: true };
+  };
+
+  const updateAdminPassword = (newPassword) => {
+    setAdminCredentials((prev) => ({ ...prev, password: newPassword }));
+    if (currentAdminUser) {
+      setAdminsList((prev) =>
+        prev.map((a) => (a.id === currentAdminUser.id ? { ...a, password: newPassword } : a))
+      );
+    }
+    return { success: true };
+  };
+
+  // Admin Product Management (Supports Multiple Pictures)
+  const addNewProduct = (newProd) => {
+    const id = (newProd.name || 'product').toLowerCase().replace(/[^a-z0-9]+/g, '-') + '-' + Date.now().toString().slice(-4);
+    
+    // Multiple images handling
+    const imageList = Array.isArray(newProd.images) && newProd.images.filter(Boolean).length > 0
+      ? newProd.images.filter(Boolean)
+      : [newProd.image || "/assets/crochet-flowers.svg"];
+
+    const primaryImage = newProd.image || imageList[0];
+
+    const productToAdd = {
+      id,
+      name: newProd.name,
+      tagline: newProd.tagline || "Handmade crochet, made with care",
+      category: newProd.category || "crochet-flowers",
+      categoryName: newProd.categoryName || "Crochet Flowers",
+      volume: newProd.volume || "50ml",
+      pricePKR: Number(newProd.pricePKR) || 2500,
+      originalPricePKR: Number(newProd.originalPricePKR) || Math.round(Number(newProd.pricePKR) * 1.2),
+      priceUSD: Number((Number(newProd.pricePKR) * 0.0036).toFixed(2)) || 15.00,
+      originalPriceUSD: Number((Number(newProd.pricePKR) * 0.0036 * 1.2).toFixed(2)) || 18.00,
+      rating: 5.0,
+      reviewsCount: 1,
+      badge: newProd.badge || "New Arrival",
+      isHero: false,
+      image: primaryImage,
+      images: imageList,
+      description: newProd.description || "Handmade crochet piece, carefully stitched with soft yarn.",
+      howToUse: newProd.howToUse || "Keep dry and spot clean gently; care depends on the selected yarn.",
+      ingredients: newProd.ingredients || "Materials and colors are selected for each crochet design.",
+      benefits: ["Handmade with care", "Custom colors available", "A thoughtful keepsake"],
+      clinicalResults: "Each handmade crochet piece has its own unique details.",
+      stock: Number(newProd.stock) || 50
+    };
+
+    // If the added product was previously in the deleted products register, remove it
+    const deletedSet = getDeletedProductIds();
+    if (deletedSet.has(productToAdd.id)) {
+      deletedSet.delete(productToAdd.id);
+      saveDeletedProductIds(deletedSet);
+    }
+
+    setProducts((prev) => {
+      const updated = [productToAdd, ...prev];
+      localStorage.setItem('ayaana_products', JSON.stringify(updated));
+      return updated;
+    });
+
+    // ☁️ Sync to Supabase Cloud Database (all devices get this immediately)
+    supabaseQuery('products', {
+      method: 'POST',
+      prefer: 'resolution=merge-duplicates',
+      body: mapProductToDb(productToAdd)
+    }).catch((err) => console.warn("Cloud product add error:", err));
+
+    return productToAdd;
+  };
+
+  const updateProduct = (updatedProd) => {
+    const updatedPricePKR = Number(updatedProd.pricePKR);
+    const imageList = Array.isArray(updatedProd.images) && updatedProd.images.filter(Boolean).length > 0
+      ? updatedProd.images.filter(Boolean)
+      : [updatedProd.image];
+    const primaryImage = updatedProd.image || imageList[0];
+
+    const mergedProduct = {
+      ...updatedProd,
+      image: primaryImage,
+      images: imageList,
+      pricePKR: updatedPricePKR,
+      priceUSD: Number((updatedPricePKR * 0.0036).toFixed(2)),
+      originalPricePKR: Math.round(updatedPricePKR * 1.2),
+      stock: updatedProd.stock !== undefined && updatedProd.stock !== null && !isNaN(Number(updatedProd.stock)) ? Number(updatedProd.stock) : 50
+    };
+
+    setProducts((prev) => {
+      const updated = prev.map((item) => (item.id === updatedProd.id ? { ...item, ...mergedProduct } : item));
+      localStorage.setItem('ayaana_products', JSON.stringify(updated));
+      return updated;
+    });
+
+    // ☁️ Sync update to Supabase Cloud Database (all devices get this immediately)
+    supabaseQuery(`products?id=eq.${updatedProd.id}`, {
+      method: 'PATCH',
+      body: {
+        name: updatedProd.name,
+        tagline: updatedProd.tagline,
+        category: updatedProd.category,
+        category_name: updatedProd.categoryName,
+        volume: updatedProd.volume,
+        price_pkr: updatedPricePKR,
+        original_price_pkr: Math.round(updatedPricePKR * 1.2),
+        price_usd: Number((updatedPricePKR * 0.0036).toFixed(2)),
+        stock: updatedProd.stock !== undefined && updatedProd.stock !== null && !isNaN(Number(updatedProd.stock)) ? Number(updatedProd.stock) : 50,
+        badge: updatedProd.badge,
+        image: primaryImage,
+        images: imageList,
+        description: updatedProd.description,
+        how_to_use: updatedProd.howToUse,
+        ingredients: updatedProd.ingredients
+      }
+    }).catch((err) => console.warn("Cloud product update error:", err));
+  };
+
+  const deleteProduct = (productId) => {
+    if (!productId) return;
+
+    // 1. Permanently register in deleted products list so it NEVER auto-restores on page reload
+    const deletedSet = getDeletedProductIds();
+    deletedSet.add(productId);
+    saveDeletedProductIds(deletedSet);
+
+    // 2. Remove product from products state & immediately sync to localStorage
+    setProducts((prev) => {
+      const updated = prev.filter((p) => p.id !== productId);
+      localStorage.setItem('ayaana_products', JSON.stringify(updated));
+      return updated;
+    });
+
+    // 3. Clear activeProduct modal if this product was open
+    setActiveProduct((current) => (current?.id === productId ? null : current));
+
+    // 4. Remove from Cart
+    setCart((prev) => {
+      const updatedCart = prev.filter((item) => item.id !== productId);
+      localStorage.setItem('ayaana_cart', JSON.stringify(updatedCart));
+      return updatedCart;
+    });
+
+    // 5. Remove from Wishlist
+    setWishlist((prev) => {
+      const updatedWishlist = prev.filter((item) => item.id !== productId);
+      localStorage.setItem('ayaana_wishlist', JSON.stringify(updatedWishlist));
+      return updatedWishlist;
+    });
+
+    // 6. Clean up site customization pointers
+    setHeroSettings((prev) => (prev.heroProductId === productId ? { ...prev, heroProductId: null } : prev));
+    setTransformationModel((prev) => (prev.productId === productId ? { ...prev, productId: null } : prev));
+    setPortraitProductIds((prev) => prev.filter((id) => id !== productId));
+
+    // 7. Background delete from Supabase cloud database if connected
+    try {
+      supabaseQuery(`products?id=eq.${productId}`, { method: 'DELETE' }).catch(() => {});
+    } catch {
+      // Ignore background cloud sync error if offline or not configured
+    }
+  };
+
+  const resetProductsToDefault = () => {
+    localStorage.removeItem(DELETED_PRODUCTS_KEY);
+    localStorage.setItem('ayaana_products', JSON.stringify(PRODUCTS));
+    setProducts(PRODUCTS);
+  };
+
+  const reorderProducts = (reorderedList) => {
+    setProducts(reorderedList);
+    localStorage.setItem('ayaana_products', JSON.stringify(reorderedList));
+  };
+
+  const moveProductToFirst = (productId) => {
+    setProducts((prev) => {
+      const idx = prev.findIndex((p) => p.id === productId);
+      if (idx <= 0) return prev;
+      const target = prev[idx];
+      const rest = prev.filter((p) => p.id !== productId);
+      const updated = [target, ...rest];
+      localStorage.setItem('ayaana_products', JSON.stringify(updated));
+      return updated;
+    });
+  };
+
+  const moveProduct = (fromIndex, toIndex) => {
+    setProducts((prev) => {
+      if (fromIndex < 0 || toIndex < 0 || fromIndex >= prev.length || toIndex >= prev.length) {
+        return prev;
+      }
+      const updated = [...prev];
+      const [moved] = updated.splice(fromIndex, 1);
+      updated.splice(toIndex, 0, moved);
+      localStorage.setItem('ayaana_products', JSON.stringify(updated));
+      return updated;
+    });
+  };
+
+  const updateOrderStatus = (orderId, newStatus) => {
+    setRecentOrders((prev) =>
+      prev.map((o) => (o.orderId === orderId ? { ...o, status: newStatus } : o))
+    );
+  };
+
+  // Price formatting helper for dual currency (amountPKR, amountUSD)
+  const formatPrice = (amountPKR, amountUSD) => {
+    if (currency === 'USD') {
+      const val = amountUSD !== undefined ? amountUSD : (amountPKR * BRAND_CONFIG.currency.USD.rate);
+      return `$${Number(val).toFixed(2)}`;
+    }
+    return `Rs. ${Math.round(Number(amountPKR)).toLocaleString()}`;
+  };
+
+  // Helper when value is already in the currently active currency
+  const formatCurrency = (val) => {
+    if (currency === 'USD') {
+      return `$${Number(val).toFixed(2)}`;
+    }
+    return `Rs. ${Math.round(Number(val)).toLocaleString()}`;
+  };
+
+  const getNumericPrice = (product) => {
+    return currency === 'USD' ? product.priceUSD : product.pricePKR;
+  };
+
+  // Cart operations
+  const addToCart = (product, quantity = 1, volume = null) => {
+    const selectedVolume = volume || product.volume;
+    setCart((prevCart) => {
+      const existingIndex = prevCart.findIndex(
+        (item) => item.id === product.id && item.volume === selectedVolume
+      );
+      if (existingIndex > -1) {
+        const updated = [...prevCart];
+        updated[existingIndex].quantity += quantity;
+        return updated;
+      } else {
+        return [...prevCart, { ...product, quantity, volume: selectedVolume }];
+      }
+    });
+    setIsCartOpen(true);
+  };
+
+  const removeFromCart = (productId, volume) => {
+    setCart((prev) => prev.filter((item) => !(item.id === productId && item.volume === volume)));
+  };
+
+  const updateCartQuantity = (productId, volume, newQty) => {
+    if (newQty <= 0) {
+      removeFromCart(productId, volume);
+      return;
+    }
+    setCart((prev) =>
+      prev.map((item) =>
+        item.id === productId && item.volume === volume
+          ? { ...item, quantity: newQty }
+          : item
+      )
+    );
+  };
+
+  const clearCart = () => {
+    setCart([]);
+  };
+
+  // Wishlist operations
+  const toggleWishlist = (product) => {
+    setWishlist((prev) => {
+      const exists = prev.some((item) => item.id === product.id);
+      if (exists) {
+        return prev.filter((item) => item.id !== product.id);
+      } else {
+        return [...prev, product];
+      }
+    });
+  };
+
+  const isInWishlist = (productId) => {
+    return wishlist.some((item) => item.id === productId);
+  };
+
+  // Cart financial calculations
+  const cartSubtotalPKR = cart.reduce((sum, item) => sum + item.pricePKR * item.quantity, 0);
+  const cartSubtotalUSD = cart.reduce((sum, item) => sum + item.priceUSD * item.quantity, 0);
+
+  const cartSubtotal = currency === 'USD' ? cartSubtotalUSD : cartSubtotalPKR;
+
+  // Discount calculation
+  const discountAmount = appliedDiscount
+    ? (cartSubtotal * (appliedDiscount.percent / 100))
+    : 0;
+
+  // Shipping calculation
+  const isFreeShipping = currency === 'USD'
+    ? cartSubtotal >= BRAND_CONFIG.shippingThresholdUSD
+    : cartSubtotal >= BRAND_CONFIG.shippingThresholdPKR;
+
+  const shippingFee = cart.length === 0 || isFreeShipping
+    ? 0
+    : (currency === 'USD' ? BRAND_CONFIG.expressDeliveryFeeUSD : BRAND_CONFIG.expressDeliveryFeePKR);
+
+  const cartTotal = Math.max(0, cartSubtotal - discountAmount + shippingFee);
+
+  const totalCartCount = cart.reduce((count, item) => count + item.quantity, 0);
+
+  // Apply promo code
+  const applyCoupon = (code) => {
+    const cleanCode = code.trim().toUpperCase();
+    if (BRAND_CONFIG.promoCodes[cleanCode]) {
+      const promo = BRAND_CONFIG.promoCodes[cleanCode];
+      setAppliedDiscount({
+        code: cleanCode,
+        percent: promo.discountPercent,
+        label: promo.label
+      });
+      return { success: true, message: `${promo.label} applied!` };
+    }
+    return { success: false, message: "Invalid promo code. Try 'CROCHET10' or 'CROCHET20'" };
+  };
+
+  const removeCoupon = () => {
+    setAppliedDiscount(null);
+    setCouponCode('');
+  };
+
+  // WhatsApp Order Link Generator
+  const generateWhatsAppOrderUrl = (customerDetails = null) => {
+    if (cart.length === 0) return `https://wa.me/${BRAND_CONFIG.whatsappNumber.replace('+', '')}`;
+
+    let message = `*CROCHET BY N&N ORDER*\n\n`;
+    message += `*Items Ordered:*\n`;
+    cart.forEach((item, idx) => {
+      const itemPrice = currency === 'USD' ? `$${item.priceUSD}` : `Rs. ${item.pricePKR}`;
+      message += `${idx + 1}. *${item.name}* (${item.volume}) x ${item.quantity} = ${itemPrice}\n`;
+    });
+
+    message += `\n*Subtotal:* ${formatPrice(cartSubtotalPKR, cartSubtotalUSD)}`;
+    if (appliedDiscount) {
+      message += `\n*Discount (${appliedDiscount.code}):* -${formatPrice(cartSubtotalPKR * (appliedDiscount.percent / 100), cartSubtotalUSD * (appliedDiscount.percent / 100))}`;
+    }
+    message += `\n*Shipping:* ${isFreeShipping ? "FREE Delivery" : formatPrice(BRAND_CONFIG.expressDeliveryFeePKR, BRAND_CONFIG.expressDeliveryFeeUSD)}`;
+    message += `\n*Grand Total:* *${formatPrice(cartTotal, cartTotal)}*\n`;
+
+    if (customerDetails) {
+      message += `\n*Customer Shipping Details:*`;
+      message += `\n• *Name:* ${customerDetails.name}`;
+      message += `\n• *Phone:* ${customerDetails.phone}`;
+      message += `\n• *City:* ${customerDetails.city}`;
+      message += `\n• *Delivery Address:* ${customerDetails.address}`;
+      if (customerDetails.paymentMethod) {
+        message += `\n• *Payment:* ${customerDetails.paymentMethod}`;
+      }
+    } else {
+      message += `\n_Please confirm my order and share estimated dispatch details!_`;
+    }
+
+    const encoded = encodeURIComponent(message);
+    return `https://wa.me/${BRAND_CONFIG.whatsappNumber.replace('+', '')}?text=${encoded}`;
+  };
+
+  // Quick single product WhatsApp order URL
+  const generateSingleProductWhatsAppUrl = (product, volume = null) => {
+    const selectedVolume = volume || product.volume;
+    const priceStr = formatPrice(product.pricePKR, product.priceUSD);
+    const text = `*Hello Crochet by N&N!*\n\nI want to order:\n*Product:* ${product.name} (${selectedVolume})\n*Price:* ${priceStr}\n\nPlease confirm availability and dispatch timeline. Thank you!`;
+    return `https://wa.me/${BRAND_CONFIG.whatsappNumber.replace('+', '')}?text=${encodeURIComponent(text)}`;
+  };
+
+  // Place online order (creates mock order with tracking)
+  const placeOrder = (orderData) => {
+    const newOrderId = `AY-${Math.floor(10000 + Math.random() * 90000)}`;
+    const newOrder = {
+      orderId: newOrderId,
+      customerName: orderData.name,
+      phone: orderData.phone,
+      city: orderData.city,
+      address: orderData.address,
+      paymentMethod: orderData.paymentMethod || "Cash on Delivery (COD)",
+      items: [...cart],
+      subtotal: cartSubtotal,
+      discount: discountAmount,
+      shipping: shippingFee,
+      total: cartTotal,
+      currency,
+      status: "Processing Order",
+      date: new Date().toISOString().split('T')[0],
+      courier: "TCS Express & Trax",
+      trackingNo: `TRX${Math.floor(10000000 + Math.random() * 90000000)}`
+    };
+
+    setRecentOrders([newOrder, ...recentOrders]);
+    clearCart();
+    return newOrder;
+  };
+
+  return (
+    <ShopContext.Provider
+      value={{
+        products,
+        setProducts,
+        addNewProduct,
+        deleteProduct,
+        resetProductsToDefault,
+        cart,
+        addToCart,
+        removeFromCart,
+        updateCartQuantity,
+        clearCart,
+        wishlist,
+        toggleWishlist,
+        isInWishlist,
+        currency,
+        setCurrency,
+        formatPrice,
+        formatCurrency,
+        getNumericPrice,
+        cartSubtotalPKR,
+        cartSubtotalUSD,
+        cartSubtotal,
+        discountAmount,
+        appliedDiscount,
+        applyCoupon,
+        removeCoupon,
+        couponCode,
+        setCouponCode,
+        isFreeShipping,
+        shippingFee,
+        cartTotal,
+        totalCartCount,
+        activeProduct,
+        setActiveProduct,
+        isCartOpen,
+        setIsCartOpen,
+        isWishlistOpen,
+        setIsWishlistOpen,
+        isCheckoutOpen,
+        setIsCheckoutOpen,
+        isTrackingOpen,
+        setIsTrackingOpen,
+        adminsList,
+        addNewAdmin,
+        deleteAdmin,
+        currentAdminUser,
+        updateProduct,
+        reorderProducts,
+        moveProductToFirst,
+        moveProduct,
+        isAdminOpen,
+        setIsAdminOpen,
+        isAdminLoggedIn,
+        adminLogin,
+        adminLogout,
+        adminCredentials,
+        updateAdminPassword,
+        recentOrders,
+        updateOrderStatus,
+        placeOrder,
+        generateWhatsAppOrderUrl,
+        generateSingleProductWhatsAppUrl,
+        // Site Customization
+        heroSettings,
+        updateHeroSettings,
+        transformationModel,
+        updateTransformationModel,
+        portraitProductIds,
+        setPortraitProductIds,
+        updatePortraitProductIds,
+        isPortraitModalOpen,
+        setIsPortraitModalOpen,
+        siteReviews,
+        addReview,
+        deleteReview,
+        updateReview
+      }}
+    >
+      {children}
+    </ShopContext.Provider>
+  );
+}
+
+// eslint-disable-next-line react/only-export-components
+export function useShop() {
+  const context = useContext(ShopContext);
+  if (!context) {
+    throw new Error('useShop must be used within a ShopProvider');
+  }
+  return context;
+}
