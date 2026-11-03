@@ -2,7 +2,6 @@
 
 A polished online storefront for handmade crochet flowers, bouquets, bags, plushies, accessories, and thoughtful gifts. Built with React and Vite, the site features an interactive product catalog, shopping cart, wishlist, and WhatsApp ordering experience.
 
-**Live store:** [ayaanabeauty.vercel.app](https://ayaanabeauty.vercel.app/)  
 **Repository:** [mianhamzaathar/Crochet-by-N-N](https://github.com/mianhamzaathar/Crochet-by-N-N)
 
 ## Highlights
